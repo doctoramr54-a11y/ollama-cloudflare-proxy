@@ -1,29 +1,18 @@
 /**
- * Ollama Cloudflare Proxy - JavaScript Edition
+ * OVHcloud AI Endpoints Proxy
  * 
- * بوابة مجانية للوصول إلى نماذج Ollama المتعددة بدون API Key.
- * تستخدم قائمة خوادم Ollama العامة المعروفة، مع نظام Fallback ذكي.
+ * بوابة مجانية للوصول إلى نماذج OVHcloud AI
+ * بدون أي مفتاح API، بحد 2 طلب/دقيقة لكل IP.
+ * متوافقة مع OpenAI SDK.
  */
-
-// ══════════════════════════════════════════════════════════════════════════
-// قائمة خوادم Ollama المجانية المتاحة (يتم تجربة كل خادم حتى ينجح أحدها)
-// ══════════════════════════════════════════════════════════════════════════
-const OLLAMA_ENDPOINTS = [
-    'https://ollama.premai.io',
-    'https://ollama-nous.abliteration.ai',
-    'https://ollama.timelesstech.net',
-    'https://ai.ai-apps.chat/api/ollama',
-    'https://ollama.abliteration.ai',
-    'https://chat.ollama.ai',
-];
 
 // ══════════════════════════════════════════════════════════════════════════
 // الإعدادات
 // ══════════════════════════════════════════════════════════════════════════
 const CONFIG = {
-    REQUEST_TIMEOUT_MS: 55000, // 55 ثانية لكل خادم
-    MAX_PARALLEL_TRIES: 2,     // عدد الخوادم التي تُجرّب بالتوازي في نفس الوقت
-    DEFAULT_MODEL: 'llama3.2:3b',
+    BASE_URL: 'https://oai.endpoints.kepler.ai.cloud.ovh.net/v1',
+    REQUEST_TIMEOUT_MS: 120000, // 120 ثانية (OVHcloud قد يستغرق وقتًا للنماذج الكبيرة)
+    DEFAULT_MODEL: 'Qwen3-32B',
 };
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -43,13 +32,14 @@ export default {
         if (request.method === 'GET') {
             return jsonResponse({
                 status: 'ok',
-                service: 'Ollama Cloudflare Proxy (JS Edition)',
-                endpoints_count: OLLAMA_ENDPOINTS.length,
-                endpoints: OLLAMA_ENDPOINTS,
+                service: 'OVHcloud AI Endpoints Proxy',
+                base_url: CONFIG.BASE_URL,
+                default_model: CONFIG.DEFAULT_MODEL,
+                note: 'Free anonymous tier: 2 requests/minute per IP',
             });
         }
 
-        // ─── 3. Only POST is allowed for chat ───
+        // ─── 3. Only POST is allowed ───
         if (request.method !== 'POST') {
             return jsonResponse({ error: 'Method not allowed. Use POST.' }, 405);
         }
@@ -79,7 +69,7 @@ export default {
             }
         }
 
-        // ─── 6. Try endpoints with fallback ───
+        // ─── 6. Send request to OVHcloud ───
         try {
             if (stream) {
                 return await handleStreamingRequest(model, prompt);
@@ -89,191 +79,104 @@ export default {
             }
         } catch (error) {
             return jsonResponse({
-                error: error.message || 'All Ollama endpoints are currently unavailable.',
+                error: error.message || 'OVHcloud AI endpoint is currently unavailable.',
             }, 503);
         }
     },
 };
 
 // ══════════════════════════════════════════════════════════════════════════
-// Non-Streaming Handler (يعيد الرد كاملًا مرة واحدة)
+// Non-Streaming Handler
 // ══════════════════════════════════════════════════════════════════════════
 async function handleNonStreamingRequest(model, prompt) {
-    const errors = [];
-
-    // جرّب الخوادم بالتوازي (2 في نفس الوقت لتوفير الوقت)
-    const batches = chunkArray(OLLAMA_ENDPOINTS, CONFIG.MAX_PARALLEL_TRIES);
-
-    for (const batch of batches) {
-        const promises = batch.map(baseUrl =>
-            tryOllamaEndpoint(baseUrl, model, prompt, false)
-                .then(reply => ({ ok: true, reply, baseUrl }))
-                .catch(err => ({ ok: false, error: err.message, baseUrl }))
-        );
-
-        const results = await Promise.all(promises);
-
-        for (const result of results) {
-            if (result.ok && result.reply) {
-                return result.reply;
-            }
-            errors.push(`${result.baseUrl}: ${result.error}`);
-        }
-    }
-
-    throw new Error(
-        'All Ollama endpoints failed. Last errors: ' + errors.slice(-3).join(' | ')
+    const response = await fetchWithTimeout(
+        `${CONFIG.BASE_URL}/chat/completions`,
+        {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                model: model,
+                messages: [{ role: 'user', content: prompt }],
+                stream: false,
+                temperature: 0.7,
+            }),
+        },
+        CONFIG.REQUEST_TIMEOUT_MS
     );
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-// Streaming Handler (يعيد الرد بصيغة SSE)
-// ══════════════════════════════════════════════════════════════════════════
-async function handleStreamingRequest(model, prompt) {
-    // جرّب أول خادم ناجح
-    let lastError = null;
-
-    for (const baseUrl of OLLAMA_ENDPOINTS) {
-        try {
-            const ollamaResponse = await fetchOllama(baseUrl, model, prompt, true);
-
-            if (!ollamaResponse.ok) {
-                lastError = `HTTP ${ollamaResponse.status}`;
-                continue;
-            }
-
-            // حوّل بث Ollama إلى SSE متوافق مع OpenAI
-            const { readable, writable } = new TransformStream();
-            transformOllamaStreamToSSE(ollamaResponse.body, writable, model);
-
-            return new Response(readable, {
-                headers: {
-                    'Content-Type': 'text/event-stream',
-                    'Cache-Control': 'no-cache',
-                    'Connection': 'keep-alive',
-                    ...corsHeaders(),
-                },
-            });
-        } catch (e) {
-            lastError = e.message;
-            continue;
-        }
-    }
-
-    throw new Error('All Ollama endpoints failed (streaming). Last: ' + lastError);
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-// Core: Try a single Ollama endpoint
-// ══════════════════════════════════════════════════════════════════════════
-async function tryOllamaEndpoint(baseUrl, model, prompt, stream) {
-    const response = await fetchOllama(baseUrl, model, prompt, stream);
 
     if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+        let errMsg = `HTTP ${response.status}`;
+        try {
+            const errData = await response.json();
+            errMsg = errData.error?.message || errData.message || errMsg;
+        } catch (e) {}
+        throw new Error(errMsg);
     }
 
-    if (stream) {
-        return response; // ارجع Response كما هو للبث
-    }
-
-    // Non-streaming: parse JSON
     const data = await response.json();
 
-    // Ollama يعيد المحتوى في data.message.content
-    if (data.message && typeof data.message.content === 'string') {
-        return data.message.content;
-    }
-    // بعض الخوادم تستخدم data.response (للـ /api/generate)
-    if (typeof data.response === 'string') {
-        return data.response;
-    }
-    // بعض الخوادم بصيغة OpenAI
     if (data.choices && data.choices[0] && data.choices[0].message) {
         return data.choices[0].message.content;
     }
 
-    throw new Error('Unexpected response format from Ollama');
+    throw new Error('Unexpected response format from OVHcloud');
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// Low-level fetch with timeout
+// Streaming Handler
 // ══════════════════════════════════════════════════════════════════════════
-async function fetchOllama(baseUrl, model, prompt, stream) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT_MS);
-
-    try {
-        const response = await fetch(`${baseUrl}/api/chat`, {
+async function handleStreamingRequest(model, prompt) {
+    const response = await fetchWithTimeout(
+        `${CONFIG.BASE_URL}/chat/completions`,
+        {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                'Content-Type': 'application/json',
+            },
             body: JSON.stringify({
                 model: model,
                 messages: [{ role: 'user', content: prompt }],
-                stream: stream,
-                options: {
-                    temperature: 0.7,
-                },
+                stream: true,
+                temperature: 0.7,
             }),
-            signal: controller.signal,
-        });
+        },
+        CONFIG.REQUEST_TIMEOUT_MS
+    );
 
-        return response;
-    } finally {
-        clearTimeout(timeoutId);
+    if (!response.ok) {
+        let errMsg = `HTTP ${response.status}`;
+        try {
+            const errData = await response.json();
+            errMsg = errData.error?.message || errData.message || errMsg;
+        } catch (e) {}
+        throw new Error(errMsg);
     }
+
+    // OVHcloud يُرجع SSE متوافق مع OpenAI مباشرة
+    return new Response(response.body, {
+        headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            ...corsHeaders(),
+        },
+    });
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// Transform Ollama SSE stream to OpenAI-compatible SSE
+// Fetch with timeout
 // ══════════════════════════════════════════════════════════════════════════
-function transformOllamaStreamToSSE(ollamaBody, writable, model) {
-    const reader = ollamaBody.getReader();
-    const writer = writable.getWriter();
-    const encoder = new TextEncoder();
-    const decoder = new TextDecoder();
-    let buffer = '';
+async function fetchWithTimeout(url, options, timeoutMs) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-    (async () => {
-        try {
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                buffer = lines.pop() || '';
-
-                for (const line of lines) {
-                    const trimmed = line.trim();
-                    if (!trimmed) continue;
-
-                    try {
-                        const json = JSON.parse(trimmed);
-                        const content = (json.message && json.message.content) || json.response || '';
-                        if (content) {
-                            const chunk = {
-                                choices: [{ delta: { content: content } }],
-                            };
-                            await writer.write(
-                                encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`)
-                            );
-                        }
-                        if (json.done) {
-                            await writer.write(encoder.encode('data: [DONE]\n\n'));
-                        }
-                    } catch (e) {
-                        // Ignore malformed lines
-                    }
-                }
-            }
-            await writer.write(encoder.encode('data: [DONE]\n\n'));
-        } catch (err) {
-            // Silence stream errors
-        } finally {
-            try { await writer.close(); } catch (e) {}
-        }
-    })();
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timeoutId);
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -296,12 +199,4 @@ function jsonResponse(data, status = 200) {
             ...corsHeaders(),
         },
     });
-}
-
-function chunkArray(arr, size) {
-    const chunks = [];
-    for (let i = 0; i < arr.length; i += size) {
-        chunks.push(arr.slice(i, i + size));
-    }
-    return chunks;
-                }
+        }
